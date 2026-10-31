@@ -1,0 +1,9 @@
+[
+ {"name": "old_tr", "trace": true, "env": {"SOUP_KERNELS_OFFLOAD_INFLIGHT_MB": "0", "SOUP_KERNELS_OFFLOAD_ATTN": "0", "SOUP_KERNELS_HEAD_CHUNK": "512"}},
+ {"name": "new_tr", "trace": true, "env": {}},
+ {"name": "new", "env": {}},
+ {"name": "infl96", "env": {"SOUP_KERNELS_OFFLOAD_INFLIGHT_MB": "96"}},
+ {"name": "noattn", "env": {"SOUP_KERNELS_OFFLOAD_ATTN": "0"}},
+ {"name": "nooff", "env": {"SOUP_KERNELS_OFFLOAD_MLP": "0", "SOUP_KERNELS_OFFLOAD_RESID": "0", "SOUP_KERNELS_OFFLOAD_ATTN": "0"}},
+ {"name": "old", "env": {"SOUP_KERNELS_OFFLOAD_INFLIGHT_MB": "0", "SOUP_KERNELS_OFFLOAD_ATTN": "0", "SOUP_KERNELS_HEAD_CHUNK": "512"}}
+]

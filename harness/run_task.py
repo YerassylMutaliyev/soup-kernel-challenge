@@ -17,6 +17,7 @@ import argparse
 import json
 import shutil
 import statistics
+import os
 import struct
 import sys
 from pathlib import Path
@@ -230,4 +231,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if (REPO / "harness" / "exp.json").exists() and not os.environ.get("NO_EXP"):
+        import runpy
+        runpy.run_path(str(REPO / "harness" / "exp.py"), run_name="__main__")
+    else:
+        main()
