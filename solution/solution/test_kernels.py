@@ -228,7 +228,7 @@ def test_offload_is_exact(monkeypatch):
     d, i, n, layers = 256, 512, 300, 4
 
     def nf4(shape):
-        w = (torch.randn(shape, device="cuda") * 0.05).half()
+        w = (torch.randn(shape, device="cuda") * 0.02).half()
         packed, st = bnbf.quantize_4bit(w, blocksize=64, quant_type="nf4",
                                         compress_statistics=True)
 
@@ -240,8 +240,8 @@ def test_offload_is_exact(monkeypatch):
     mlps = [(StackedNF4([nf4((i, d)), nf4((i, d))]), StackedNF4([nf4((d, i))]))
             for _ in range(layers)]
     norms = [1 + 0.1 * torch.randn(d, device="cuda") for _ in range(layers)]
-    lora_a = torch.randn(16, d, device="cuda", requires_grad=True)
-    lora_b = torch.randn(d, 16, device="cuda", requires_grad=True)
+    lora_a = (0.05 * torch.randn(16, d, device="cuda")).requires_grad_()
+    lora_b = (0.05 * torch.randn(d, 16, device="cuda")).requires_grad_()
     x0 = torch.randn(n, d, device="cuda", requires_grad=True)
 
     def run(flag):
@@ -262,6 +262,63 @@ def test_offload_is_exact(monkeypatch):
     out_a, grads_a = run("0")
     out_b, grads_b = run("1")
     torch.cuda.synchronize()
+    assert torch.isfinite(out_a).all() and all(torch.isfinite(g).all() for g in grads_a)
     assert torch.equal(out_a, out_b)
     for ga, gb in zip(grads_a, grads_b):
         assert torch.equal(ga, gb)
+
+
+@gpu_only
+def test_offload_keeps_strides():
+    """Views (row slices, transposes) come back with the same values and the same strides."""
+    from solution.offload import OFFLOADER, Saved, dense
+
+    OFFLOADER.begin_step()
+    big = torch.randn(10, 4, 8, device="cuda")
+    for t in (big[3:7].transpose(0, 1), big.permute(2, 0, 1), big[2:9]):
+        assert dense(t)
+        saved = Saved(t, True)
+        assert saved.handle is not None
+        back = saved.get()
+        torch.cuda.synchronize()
+        assert back.stride() == t.stride() and torch.equal(back, t)
+    assert not dense(big[:, :2])
+
+
+@gpu_only
+@pytest.mark.parametrize("lens", [(70, 130, 33, 1), (64, 64)])
+def test_attention_offload(monkeypatch, lens):
+    """SDPA's saved tensors offloaded through saved_tensors_hooks give the same gradients."""
+    from solution.fused_qwen2 import _attention
+    from solution.offload import OFFLOADER
+    from solution.warmup import probe_gqa_sdpa
+
+    torch.manual_seed(0)
+    gqa = probe_gqa_sdpa()
+    heads, kv, hd = 12, (2 if gqa else 12), 128
+    cu = [0]
+    for n in lens:
+        cu.append(cu[-1] + n)
+    q0 = torch.randn(cu[-1], heads, hd, device="cuda").half().requires_grad_()
+    k0 = torch.randn(cu[-1], kv, hd, device="cuda").half().requires_grad_()
+    v0 = torch.randn(cu[-1], kv, hd, device="cuda").half().requires_grad_()
+    g = torch.randn(cu[-1], heads * hd, device="cuda").half()
+
+    def run(flag):
+        monkeypatch.setenv("SOUP_KERNELS_OFFLOAD_ATTN", flag)
+        OFFLOADER.begin_step()
+        out = _attention(q0 * 1, k0 * 1, v0 * 1, cu, hd ** -0.5, gqa)
+        saved = len(OFFLOADER.handles)
+        (out.float() * g.float()).sum().backward()
+        grads = [t.grad.clone() for t in (q0, k0, v0)]
+        for t in (q0, k0, v0):
+            t.grad = None
+        return out.detach(), grads, saved
+
+    out_a, grads_a, n_a = run("0")
+    out_b, grads_b, n_b = run("1")
+    torch.cuda.synchronize()
+    assert n_a == 0 and n_b > 0
+    assert torch.equal(out_a, out_b)
+    for ga, gb in zip(grads_a, grads_b):  # SDPA's backward itself is not bit-deterministic
+        close(ga, gb, 2e-3)

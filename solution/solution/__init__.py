@@ -17,10 +17,11 @@ runs through fused_qwen2.py and these Triton kernels, all written for this task:
 Set SOUP_KERNELS_DISABLE=1 to turn everything off (base Soup behaviour).
 """
 
-from . import patches
+from . import patches, trace
 
 
 def apply():
+    trace.log(ev="apply_start")
     patches.install()
     try:
         from . import warmup
@@ -28,3 +29,9 @@ def apply():
         warmup.start()
     except Exception as exc:  # noqa: BLE001 - compiling ahead is only an optimization
         print(f"[solution] kernel warm-up skipped: {exc}", flush=True)
+    if trace.on():
+        import atexit
+
+        trace.install_backward_timer()
+        atexit.register(lambda: trace.log(ev="exit", **trace.memory()))
+    trace.log(ev="apply_end")

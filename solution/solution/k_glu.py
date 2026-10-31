@@ -61,10 +61,11 @@ def glu_forward(gu):
     return h
 
 
-def glu_backward(gu, dh):
+def glu_backward(gu, dh, out=None):
+    """[dgate | dup]; `out` may be `gu` itself (each program reads its tile before writing it)."""
     m, two_i = gu.shape
     i = two_i // 2
-    dgu = torch.empty_like(gu)
+    dgu = torch.empty_like(gu) if out is None else out
     if m:
         grid = (triton.cdiv(m, TILE_M), triton.cdiv(i, TILE_N))
         glu_bwd_kernel[grid](gu, dh, dgu, m, I=i, TM=TILE_M, TN=TILE_N, num_warps=4)

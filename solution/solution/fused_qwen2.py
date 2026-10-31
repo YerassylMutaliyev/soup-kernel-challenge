@@ -23,18 +23,22 @@ its fp16 gate|up output, and attention saves what SDPA needs.
 """
 
 import os
+import time
 
 import torch
 import torch.nn.functional as F
+
+from . import trace
 
 from .k_glu import glu_backward, glu_forward
 from .k_head import FusedLMHeadLoss
 from .k_nf4 import NF4Weight, StackedNF4
 from .k_rmsnorm import rmsnorm_fp16, rmsnorm_fp16_dropout
 from .k_rope import FusedRopeQKV
-from .offload import OFFLOADER, Saved, keep_last_layers, offload_mlp, offload_resid
+from .offload import (OFFLOADER, Saved, keep_last_layers, offload_attn, offload_mlp,
+                      offload_resid, pack_saved, unpack_saved)
 
-HEAD_CHUNK = int(os.environ.get("SOUP_KERNELS_HEAD_CHUNK", "512"))  # logits rows alive at once
+HEAD_CHUNK = int(os.environ.get("SOUP_KERNELS_HEAD_CHUNK", "256"))  # logits rows alive at once
 
 
 class FrozenNF4Linear(torch.autograd.Function):
@@ -84,7 +88,7 @@ class FrozenNF4GatedMLP(torch.autograd.Function):
             w_d = ctx.down.decode()
             dh = torch.mm(dy.to(torch.float16), w_d)
             del w_d
-            dgu = glu_backward(gu, dh)
+            dgu = glu_backward(gu, dh, out=gu)  # in place: gu is not needed afterwards
             del dh, gu
             w_gu = ctx.gate_up.decode()
             dx = torch.mm(dgu, w_gu)
@@ -243,6 +247,15 @@ def _keep_mask(rows, cols, p, device):
 
 
 def _attention(q, k, v, cu, scale, gqa):
+    """Causal attention per sequence. What SDPA keeps for backward (q, k, v, output) is offloaded
+    like our own saved tensors."""
+    if offload_attn():
+        with torch.autograd.graph.saved_tensors_hooks(pack_saved, unpack_saved):
+            return _attention_impl(q, k, v, cu, scale, gqa)
+    return _attention_impl(q, k, v, cu, scale, gqa)
+
+
+def _attention_impl(q, k, v, cu, scale, gqa):
     outs = []
     lens = [e - s for s, e in zip(cu[:-1], cu[1:])]
     if len(set(lens)) == 1 and lens[0] > 0:
@@ -297,7 +310,9 @@ def fused_loss_forward(lm, plan, input_ids, attention_mask, labels, num_items_in
     handle (then the caller runs the original forward)."""
     from . import warmup
 
+    t_enter = time.perf_counter()
     warmup.wait()  # the background compile must be done before the first launch
+    t_ready = time.perf_counter()
     OFFLOADER.begin_step()
     dev = input_ids.device
     bsz, seqlen = input_ids.shape
@@ -328,14 +343,17 @@ def fused_loss_forward(lm, plan, input_ids, attention_mask, labels, num_items_in
     try:
         for i, layer_plan in enumerate(plan.layers):
             OFFLOADER.active = i < last_offloaded
+            OFFLOADER.begin_layer()
             x = _layer_forward(layer_plan, x, step)
     finally:
         OFFLOADER.active = True
     OFFLOADER.active = False
+    OFFLOADER.begin_layer()
     try:
         h16 = rmsnorm_fp16(x, plan.norm.weight, plan.norm.variance_epsilon)
     finally:
         OFFLOADER.active = True
+    t_layers = time.perf_counter()
 
     shifted = F.pad(labels, (0, 1), value=-100)[:, 1:]
     targets = shifted.reshape(-1).index_select(0, flat_idx).contiguous()
@@ -349,6 +367,10 @@ def fused_loss_forward(lm, plan, input_ids, attention_mask, labels, num_items_in
         n_items = torch.tensor(float(num_items_in_batch), device=dev)
     loss, ent, tok_loss, correct = FusedLMHeadLoss.apply(
         h16, plan.embed.weight, targets, grad_scale, n_items, HEAD_CHUNK)
+    if trace.on():  # the head synchronizes once (labelled row count), so this is GPU time too
+        trace.log(ev="fwd", tokens=cu[-1], padded=bsz * seqlen, wait=round(t_ready - t_enter, 4),
+                  layers_cpu=round(t_layers - t_ready, 4),
+                  head=round(time.perf_counter() - t_layers, 4), **trace.memory())
 
     token_entropy = torch.zeros(bsz * seqlen, dtype=torch.float32, device=dev)
     token_entropy.index_copy_(0, flat_idx, ent)

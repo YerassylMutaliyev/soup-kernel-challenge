@@ -10,9 +10,12 @@ function stays in one thread). The fused forward waits for all of it before its 
 
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+
+from . import trace
 
 _THREAD = None
 _ERRORS = []
@@ -92,6 +95,7 @@ def triton_pow2(n):
 
 
 def _run_group(jobs):
+    t0 = time.perf_counter()
     for job in jobs:
         try:
             kernel = job()
@@ -102,14 +106,17 @@ def _run_group(jobs):
                 init()
         except Exception as exc:  # noqa: BLE001 - the real launch compiles it instead
             _ERRORS.append(repr(exc))
+    trace.log(ev="compiled", jobs=len(jobs), s=round(time.perf_counter() - t0, 3))
 
 
 def _compile_all():
     global GQA_SDPA
+    trace.log(ev="warmup_start")
     GQA_SDPA = probe_gqa_sdpa()
     workers = int(os.environ.get("SOUP_KERNELS_WARMUP_THREADS", "4"))
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         list(pool.map(_run_group, _groups()))
+    trace.log(ev="warmup_end", gqa=GQA_SDPA, errors=_ERRORS[:3])
 
 
 def start():
@@ -121,6 +128,13 @@ def start():
         _THREAD.start()
 
 
+_WAITED = []
+
+
 def wait():
     if _THREAD is not None:
+        t0 = time.perf_counter()
         _THREAD.join()
+        if not _WAITED:
+            _WAITED.append(1)
+            trace.log(ev="first_wait", s=round(time.perf_counter() - t0, 3))
